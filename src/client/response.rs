@@ -275,8 +275,15 @@ impl Response {
     #[cfg(feature = "json")]
     #[cfg_attr(docsrs, doc(cfg(feature = "json")))]
     pub async fn json<T: DeserializeOwned>(self) -> crate::Result<T> {
-        let full = self.bytes().await?;
-        serde_json::from_slice(&full).map_err(Error::decode)
+        match http_body_util::BodyExt::collect(self.res.into_body())
+            .await
+            .map(Collected::<Bytes>::to_bytes)
+        {
+            Ok(full) => serde_json::from_slice(&full)
+                .map_err(Error::decode)
+                .map_err(|err| err.with_uri(self.uri)),
+            Err(err) => Err(err.with_uri(self.uri)),
+        }
     }
 
     /// Get the full response body as [`Bytes`].
@@ -301,6 +308,7 @@ impl Response {
         BodyExt::collect(self.res.into_body())
             .await
             .map(Collected::<Bytes>::to_bytes)
+            .map_err(|err| err.with_uri(self.uri))
     }
 
     /// Convert the response into a [`Stream`] of [`Bytes`] from the body.
@@ -507,7 +515,7 @@ impl HttpBody for Response {
 
     type Error = Error;
 
-    #[inline]
+    #[inline(always)]
     fn poll_frame(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -515,12 +523,12 @@ impl HttpBody for Response {
         Pin::new(self.res.body_mut()).poll_frame(cx)
     }
 
-    #[inline]
+    #[inline(always)]
     fn is_end_stream(&self) -> bool {
         self.res.body().is_end_stream()
     }
 
-    #[inline]
+    #[inline(always)]
     fn size_hint(&self) -> http_body::SizeHint {
         self.res.body().size_hint()
     }

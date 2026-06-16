@@ -7,8 +7,6 @@ use bytes::Bytes;
 use http_body::{Body as HttpBody, SizeHint};
 use http_body_util::{BodyExt, Either, Full, combinators::BoxBody};
 use pin_project_lite::pin_project;
-#[cfg(feature = "stream")]
-use {tokio::fs::File, tokio_util::io::ReaderStream};
 
 use crate::error::{BoxError, Error};
 
@@ -177,11 +175,11 @@ impl From<&'static str> for Body {
     }
 }
 
-#[cfg(feature = "stream")]
-impl From<File> for Body {
+#[cfg(all(feature = "tokio-rt", feature = "stream"))]
+impl From<tokio::fs::File> for Body {
     #[inline]
-    fn from(file: File) -> Body {
-        Body::wrap_stream(ReaderStream::new(file))
+    fn from(file: tokio::fs::File) -> Body {
+        Body::wrap_stream(tokio_util::io::ReaderStream::new(file))
     }
 }
 
@@ -189,7 +187,7 @@ impl HttpBody for Body {
     type Data = Bytes;
     type Error = Error;
 
-    #[inline]
+    #[inline(always)]
     fn poll_frame(
         mut self: Pin<&mut Self>,
         cx: &mut Context,
@@ -200,12 +198,12 @@ impl HttpBody for Body {
         })
     }
 
-    #[inline]
+    #[inline(always)]
     fn size_hint(&self) -> SizeHint {
         self.0.size_hint()
     }
 
-    #[inline]
+    #[inline(always)]
     fn is_end_stream(&self) -> bool {
         self.0.is_end_stream()
     }
@@ -221,6 +219,7 @@ where
     type Data = Bytes;
     type Error = B::Error;
 
+    #[inline(always)]
     fn poll_frame(
         self: Pin<&mut Self>,
         cx: &mut Context,
@@ -232,12 +231,12 @@ where
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn size_hint(&self) -> SizeHint {
         self.inner.size_hint()
     }
 
-    #[inline]
+    #[inline(always)]
     fn is_end_stream(&self) -> bool {
         self.inner.is_end_stream()
     }

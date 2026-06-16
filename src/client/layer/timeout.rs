@@ -4,20 +4,19 @@ pub mod body;
 mod future;
 
 use std::{
-    sync::Arc,
     task::{Context, Poll},
     time::Duration,
 };
 
 use http::{Request, Response};
 use tower::{BoxError, Layer, Service};
-use wreq_proto::rt::{Time, Timer};
+use wreq_proto::rt::Timer as _;
 
 use self::{
     body::TimeoutBody,
     future::{ResponseBodyTimeoutFuture, ResponseFuture},
 };
-use crate::config::RequestConfig;
+use crate::{config::RequestConfig, rt::Timer};
 
 /// Options for configuring timeouts.
 #[derive(Clone, Copy, Default)]
@@ -48,13 +47,15 @@ impl_request_config_value!(TimeoutOptions);
 // This layer allows you to set a total timeout and a read timeout for requests.
 #[derive(Clone)]
 pub struct TimeoutLayer {
+    timer: Timer,
     timeout: RequestConfig<TimeoutOptions>,
 }
 
 impl TimeoutLayer {
     /// Create a new [`TimeoutLayer`].
-    pub fn new(options: TimeoutOptions) -> Self {
+    pub fn new(timer: Timer, options: TimeoutOptions) -> Self {
         TimeoutLayer {
+            timer,
             timeout: RequestConfig::new(Some(options)),
         }
     }
@@ -67,15 +68,17 @@ impl<S> Layer<S> for TimeoutLayer {
     fn layer(&self, service: S) -> Self::Service {
         Timeout {
             inner: service,
+            timer: self.timer.clone(),
             timeout: self.timeout,
         }
     }
 }
 
-/// Middleware that applies total and per-read timeouts to a [`Service`] response body.
+/// Middleware that applies request and response-body timeouts to a [`Service`].
 #[derive(Clone)]
 pub struct Timeout<T> {
     inner: T,
+    timer: Timer,
     timeout: RequestConfig<TimeoutOptions>,
 }
 
@@ -83,9 +86,9 @@ impl<ReqBody, ResBody, S> Service<Request<ReqBody>> for Timeout<S>
 where
     S: Service<Request<ReqBody>, Response = Response<ResBody>, Error = BoxError>,
 {
-    type Response = S::Response;
+    type Response = Response<TimeoutBody<ResBody>>;
     type Error = BoxError;
-    type Future = ResponseFuture<S::Future>;
+    type Future = ResponseFuture<ResponseBodyTimeoutFuture<S::Future>>;
 
     #[inline(always)]
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
@@ -96,77 +99,14 @@ where
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
         let (total_timeout, read_timeout) = fetch_timeout_options(&self.timeout, req.extensions());
         ResponseFuture {
-            response: self.inner.call(req),
-            total_timeout: total_timeout.map(tokio::time::sleep),
-            read_timeout: read_timeout.map(tokio::time::sleep),
-        }
-    }
-}
-
-/// [`Layer`] that applies a [`ResponseBodyTimeout`] middleware to a service.
-// This layer allows you to set a total timeout and a read timeout for the response body.
-#[derive(Clone)]
-pub struct ResponseBodyTimeoutLayer {
-    timer: Time,
-    timeout: RequestConfig<TimeoutOptions>,
-}
-
-impl ResponseBodyTimeoutLayer {
-    /// Creates a new [`ResponseBodyTimeoutLayer`].
-    pub fn new<M>(timer: M, options: TimeoutOptions) -> Self
-    where
-        M: Timer + Send + Sync + 'static,
-    {
-        Self {
-            timer: Time::Timer(Arc::new(timer)),
-            timeout: RequestConfig::new(Some(options)),
-        }
-    }
-}
-
-impl<S> Layer<S> for ResponseBodyTimeoutLayer {
-    type Service = ResponseBodyTimeout<S>;
-
-    #[inline(always)]
-    fn layer(&self, inner: S) -> Self::Service {
-        ResponseBodyTimeout {
-            inner,
-            timeout: self.timeout,
-            timer: self.timer.clone(),
-        }
-    }
-}
-
-/// Middleware that timeouts the response body of a request with a [`Service`] to a total timeout
-/// and a read timeout.
-#[derive(Clone)]
-pub struct ResponseBodyTimeout<S> {
-    inner: S,
-    timeout: RequestConfig<TimeoutOptions>,
-    timer: Time,
-}
-
-impl<S, ReqBody, ResBody> Service<Request<ReqBody>> for ResponseBodyTimeout<S>
-where
-    S: Service<Request<ReqBody>, Response = Response<ResBody>>,
-{
-    type Response = Response<TimeoutBody<ResBody>>;
-    type Error = S::Error;
-    type Future = ResponseBodyTimeoutFuture<S::Future>;
-
-    #[inline(always)]
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.inner.poll_ready(cx)
-    }
-
-    #[inline(always)]
-    fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
-        let (total_timeout, read_timeout) = fetch_timeout_options(&self.timeout, req.extensions());
-        ResponseBodyTimeoutFuture {
-            inner: self.inner.call(req),
-            total_timeout,
-            read_timeout,
-            timer: self.timer.clone(),
+            fut: ResponseBodyTimeoutFuture {
+                fut: self.inner.call(req),
+                timer: self.timer.clone(),
+                total_timeout,
+                read_timeout,
+            },
+            total_timeout: total_timeout.map(|timeout| self.timer.sleep(timeout)),
+            read_timeout: read_timeout.map(|timeout| self.timer.sleep(timeout)),
         }
     }
 }

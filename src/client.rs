@@ -1,5 +1,3 @@
-mod rt;
-
 pub(super) mod body;
 pub(super) mod emulate;
 pub(super) mod future;
@@ -25,7 +23,6 @@ use std::{
 };
 
 use http::header::{HeaderMap, HeaderValue, USER_AGENT};
-use rt::{TokioExecutor, TokioTimer};
 use tower::{
     BoxError, Layer, Service, ServiceBuilder, ServiceExt,
     retry::{Retry, RetryLayer},
@@ -51,10 +48,7 @@ use self::{
         config::{ConfigService, ConfigServiceLayer},
         redirect::{FollowRedirect, FollowRedirectLayer},
         retry::RetryPolicy,
-        timeout::{
-            ResponseBodyTimeout, ResponseBodyTimeoutLayer, Timeout, TimeoutLayer, TimeoutOptions,
-            body::TimeoutBody,
-        },
+        timeout::{Timeout, TimeoutLayer, TimeoutOptions, body::TimeoutBody},
     },
     request::{Request, RequestBuilder},
     response::Response,
@@ -67,7 +61,7 @@ use crate::{
     IntoUri, Method, Proxy,
     conn::{
         BoxedConnectorLayer, BoxedConnectorService, Conn, Unnameable, connector::Connector,
-        http::HttpTransport, tcp::SocketBindOptions,
+        http::HttpConnect, net::SocketBindOptions,
     },
     dns::{DnsResolverWithOverrides, DynResolver, GaiResolver, IntoResolve, Resolve},
     error::{self, Error},
@@ -77,6 +71,7 @@ use crate::{
     proxy::Matcher as ProxyMatcher,
     redirect::{self, FollowRedirectPolicy},
     retry,
+    rt::{BoxSendFuture, Executor, Timer},
     tls::{
         AlpnProtocol, TlsOptions, TlsVersion,
         keylog::KeyLog,
@@ -85,65 +80,60 @@ use crate::{
     },
 };
 
-/// Decompression service type. Identity type when compression features are disabled.
 #[cfg(not(any(
     feature = "gzip",
     feature = "zstd",
     feature = "brotli",
     feature = "deflate"
 )))]
-type Decompression<T> = T;
+type MaybeDecompression<T> = T;
 
-/// Service wrapper that handles response body decompression.
 #[cfg(any(
     feature = "gzip",
     feature = "zstd",
     feature = "brotli",
     feature = "deflate"
 ))]
-type Decompression<T> = self::layer::decoder::Decompression<T>;
+type MaybeDecompression<T> = self::layer::decoder::Decompression<T>;
 
-/// Response body type with timeout and optional decompression.
-#[cfg(any(
-    feature = "gzip",
-    feature = "zstd",
-    feature = "brotli",
-    feature = "deflate"
-))]
-type ResponseBody = TimeoutBody<tower_http::decompression::DecompressionBody<Incoming>>;
-
-/// Response body type with timeout only (no compression features).
 #[cfg(not(any(
     feature = "gzip",
     feature = "zstd",
     feature = "brotli",
     feature = "deflate"
 )))]
-type ResponseBody = TimeoutBody<Incoming>;
+type MaybeDecompressionBody<T> = T;
 
-/// The complete HTTP client service stack with all middleware layers.
+#[cfg(any(
+    feature = "gzip",
+    feature = "zstd",
+    feature = "brotli",
+    feature = "deflate"
+))]
+type MaybeDecompressionBody<T> = tower_http::decompression::DecompressionBody<T>;
+
 type ClientService = Timeout<
-    ResponseBodyTimeout<
-        ConfigService<
-            Decompression<
-                Retry<
-                    RetryPolicy,
-                    FollowRedirect<HttpClient<Connector, Body>, FollowRedirectPolicy>,
-                >,
-            >,
+    ConfigService<
+        MaybeDecompression<
+            Retry<RetryPolicy, FollowRedirect<HttpClient<Connector, Body>, FollowRedirectPolicy>>,
         >,
     >,
 >;
 
-/// Type-erased client service for dynamic middleware composition.
-type BoxedClientService =
-    BoxCloneSyncService<http::Request<Body>, http::Response<ResponseBody>, BoxError>;
-
-/// Layer type for wrapping boxed client services with additional middleware.
-type BoxedClientLayer = BoxCloneSyncServiceLayer<
-    BoxedClientService,
+type BoxedClientService = BoxCloneSyncService<
     http::Request<Body>,
-    http::Response<ResponseBody>,
+    http::Response<TimeoutBody<MaybeDecompressionBody<Incoming>>>,
+    BoxError,
+>;
+
+type BoxedClientServiceLayer = BoxCloneSyncServiceLayer<
+    BoxCloneSyncService<
+        http::Request<Body>,
+        http::Response<MaybeDecompressionBody<Incoming>>,
+        BoxError,
+    >,
+    http::Request<Body>,
+    http::Response<MaybeDecompressionBody<Incoming>>,
     BoxError,
 >;
 
@@ -161,7 +151,6 @@ type BoxedClientLayer = BoxCloneSyncServiceLayer<
 ///
 /// [`Rc`]: std::rc::Rc
 #[derive(Clone)]
-#[repr(transparent)]
 pub struct Client(Arc<Either<ClientService, BoxedClientService>>);
 
 /// A [`ClientBuilder`] can be used to create a [`Client`] with custom configuration.
@@ -219,7 +208,7 @@ struct Config {
     dns_resolver: Option<Arc<dyn Resolve>>,
     http_version_pref: HttpVersionPref,
     https_only: bool,
-    layers: Vec<BoxedClientLayer>,
+    layers: Vec<BoxedClientServiceLayer>,
     connector_layers: Vec<BoxedConnectorLayer>,
     tls_sni: bool,
     tls_info: bool,
@@ -234,6 +223,8 @@ struct Config {
     tls_options: Option<TlsOptions>,
     http1_options: Option<Http1Options>,
     http2_options: Option<Http2Options>,
+    timer: Timer,
+    executor: Executor,
 }
 
 // ===== impl Client =====
@@ -318,6 +309,8 @@ impl Client {
                 tls_max_version: None,
                 tls_session_cache: None,
                 tls_options: None,
+                timer: Timer::default(),
+                executor: Executor::default(),
             },
         }
     }
@@ -569,7 +562,7 @@ impl ClientBuilder {
                 .build(config.tls_options, config.connector_layers)?;
 
             #[allow(unused_mut)]
-            let mut builder = HttpClient::builder(TokioExecutor::new());
+            let mut builder = HttpClient::builder(config.executor);
 
             #[cfg(feature = "cookies")]
             {
@@ -580,8 +573,8 @@ impl ClientBuilder {
                 .http1_options(config.http1_options)
                 .http2_options(config.http2_options)
                 .http2_only(matches!(config.http_version_pref, HttpVersionPref::Http2))
-                .http2_timer(TokioTimer::new())
-                .pool_timer(TokioTimer::new())
+                .http2_timer(config.timer.clone())
+                .pool_timer(config.timer.clone())
                 .pool_idle_timeout(config.pool_idle_timeout)
                 .pool_max_idle_per_host(config.pool_max_idle_per_host)
                 .pool_max_size(config.pool_max_size)
@@ -611,10 +604,6 @@ impl ClientBuilder {
                 .service(service);
 
             let service = ServiceBuilder::new()
-                .layer(ResponseBodyTimeoutLayer::new(
-                    TokioTimer::new(),
-                    config.timeout_options,
-                ))
                 .layer(ConfigServiceLayer::new(
                     config.https_only,
                     config.headers,
@@ -624,7 +613,7 @@ impl ClientBuilder {
 
             if config.layers.is_empty() {
                 let service = ServiceBuilder::new()
-                    .layer(TimeoutLayer::new(config.timeout_options))
+                    .layer(TimeoutLayer::new(config.timer, config.timeout_options))
                     .service(service);
 
                 Either::Left(service)
@@ -637,7 +626,7 @@ impl ClientBuilder {
                     });
 
                 let service = ServiceBuilder::new()
-                    .layer(TimeoutLayer::new(config.timeout_options))
+                    .layer(TimeoutLayer::new(config.timer, config.timeout_options))
                     .service(service)
                     .map_err(error::map_timeout_to_request_error);
 
@@ -646,6 +635,28 @@ impl ClientBuilder {
         };
 
         Ok(Client(Arc::new(client)))
+    }
+
+    // Runtime options
+
+    /// Provide a timer to be used for timeouts and intervals in client.
+    #[inline]
+    pub fn timer<M>(mut self, timer: M) -> Self
+    where
+        M: wreq_proto::rt::Timer + Send + Sync + 'static,
+    {
+        self.config.timer = Timer::new(timer);
+        self
+    }
+
+    /// Provide an executor to run background tasks in the client.
+    #[inline]
+    pub fn executor<E>(mut self, executor: E) -> Self
+    where
+        E: wreq_proto::rt::Executor<BoxSendFuture> + Send + Sync + 'static,
+    {
+        self.config.executor = Executor::new(executor);
+        self
     }
 
     // Higher-level options
@@ -1571,9 +1582,21 @@ impl ClientBuilder {
     #[inline]
     pub fn layer<L>(mut self, layer: L) -> ClientBuilder
     where
-        L: Layer<BoxedClientService> + Clone + Send + Sync + 'static,
-        L::Service: Service<http::Request<Body>, Response = http::Response<ResponseBody>, Error = BoxError>
-            + Clone
+        L: Layer<
+                BoxCloneSyncService<
+                    http::Request<Body>,
+                    http::Response<MaybeDecompressionBody<Incoming>>,
+                    BoxError,
+                >,
+            > + Clone
+            + Send
+            + Sync
+            + 'static,
+        L::Service: Service<
+                http::Request<Body>,
+                Response = http::Response<MaybeDecompressionBody<Incoming>>,
+                Error = BoxError,
+            > + Clone
             + Send
             + Sync
             + 'static,
