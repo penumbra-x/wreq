@@ -114,9 +114,7 @@ type MaybeDecompressionBody<T> = tower_http::decompression::DecompressionBody<T>
 
 type ClientService = Timeout<
     ConfigService<
-        MaybeDecompression<
-            Retry<RetryPolicy, FollowRedirect<HttpClient<Connector, Body>, FollowRedirectPolicy>>,
-        >,
+        MaybeDecompression<Retry<RetryPolicy, FollowRedirect<HttpClient<Connector, Body>>>>,
     >,
 >;
 
@@ -966,7 +964,11 @@ impl ClientBuilder {
         self
     }
 
-    /// Enable or disable automatic setting of the `Referer` header.
+    /// Enable or disable automatic `Referer` management during redirects.
+    ///
+    /// When enabled, redirect responses can control how an existing `Referer`
+    /// is forwarded through `Referrer-Policy`. No header is added when the
+    /// request has none.
     ///
     /// Default is `true`.
     #[inline]
@@ -1043,6 +1045,9 @@ impl ClientBuilder {
     }
 
     /// Set a timeout for only the connect phase of a `Client`.
+    ///
+    /// When a host resolves to multiple addresses, the timeout covers the
+    /// entire connection race.
     ///
     /// Default is `None`.
     ///
@@ -1268,18 +1273,17 @@ impl ClientBuilder {
         self
     }
 
-    /// Set timeout for [RFC 6555 (Happy Eyeballs)][RFC 6555] algorithm.
+    /// Set the delay between connection attempts for
+    /// [RFC 8305 (Happy Eyeballs v2)][RFC 8305].
     ///
-    /// If hostname resolves to both IPv4 and IPv6 addresses and connection
-    /// cannot be established using preferred address family before timeout
-    /// elapses, then connector will in parallel attempt connection using other
-    /// address family.
+    /// The first address is attempted immediately. Later addresses are started
+    /// after this delay without waiting for the previous attempt to finish.
     ///
     /// If `None`, parallel connection attempts are disabled.
     ///
     /// Default is 300 milliseconds.
     ///
-    /// [RFC 6555]: https://tools.ietf.org/html/rfc6555
+    /// [RFC 8305]: https://www.rfc-editor.org/rfc/rfc8305.html#section-5
     #[inline]
     pub fn tcp_happy_eyeballs_timeout<D>(mut self, val: D) -> ClientBuilder
     where

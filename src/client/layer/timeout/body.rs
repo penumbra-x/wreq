@@ -206,23 +206,27 @@ where
     ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
         let mut this = self.project();
 
-        // Error if the timeout has expired.
+        // Start the timeout on the first poll.
         if this.sleep.is_none() {
-            this.sleep.set(Some(this.timer.sleep(*this.timeout)));
+            let deadline = this.timer.now() + *this.timeout;
+            this.sleep.set(Some(this.timer.sleep_until(deadline)));
         }
 
         // Error if the timeout has expired.
         if let Some(sleep) = this.sleep.as_mut().as_pin_mut() {
             if sleep.poll(cx).is_ready() {
-                return Poll::Ready(Some(Err(Box::new(TimedOut))));
+                return Poll::Ready(Some(Err(Error::body(TimedOut).into())));
             }
         }
 
         // Poll the actual body
         match ready!(this.body.poll_frame(cx)) {
             Some(Ok(frame)) => {
-                // Reset timeout on successful read
-                this.sleep.set(None);
+                // Reuse the sleep to avoid allocating and registering a new timer for every frame.
+                if let Some(sleep) = this.sleep.as_mut().as_pin_mut() {
+                    let deadline = this.timer.now() + *this.timeout;
+                    this.timer.reset(sleep.get_mut(), deadline);
+                }
                 Poll::Ready(Some(Ok(frame)))
             }
             Some(Err(err)) => Poll::Ready(Some(Err(err.into()))),

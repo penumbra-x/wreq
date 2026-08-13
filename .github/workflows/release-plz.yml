@@ -16,7 +16,7 @@ jobs:
     steps:
       - &checkout
         name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: true
@@ -28,6 +28,7 @@ jobs:
         uses: release-plz/action@v0.5
         with:
           command: release
+          config: .github/.release-plz.toml
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
 
@@ -48,5 +49,6 @@ jobs:
         uses: release-plz/action@v0.5
         with:
           command: release-pr
+          config: .github/.release-plz.toml
         env:
           GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
